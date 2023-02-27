@@ -13,7 +13,7 @@ Copyright 2021 The Microsoft DeepSpeed Team
 # LICENSE file in the root directory of this source tree.
 
 from deepspeed.utils.timer import SynchronizedWallClockTimer
-from deepspeed.utils import logger
+from deepspeed.utils import logger, topology
 from typing import Callable, Dict, TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
@@ -22,6 +22,11 @@ from torch.nn import Module
 import torch.nn.functional as F
 from deepspeed.utils import groups
 from .mappings import drop_tokens, gather_tokens
+from deepspeed.ops.op_builder import UtilsBuilder
+
+util_ops = UtilsBuilder().load()
+flatten = util_ops.flatten
+unflatten = util_ops.unflatten
 
 if TYPE_CHECKING:
     Base = Module[Tensor]
@@ -103,6 +108,35 @@ class _AllToAll(torch.autograd.Function):
     def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor]:
         return (None, _AllToAll.apply(ctx.group, *grad_output))
 
+class _AllToAll_UNEQUAL(torch.autograd.Function):
+    @staticmethod
+    def forward(
+            ctx: Any,
+            group: torch.distributed.ProcessGroup,
+            input: Tensor,
+            input_split: list,
+            output_split: list) -> Tensor:  # type: ignore
+        ctx.group = group
+        ctx.input_split=input_split
+        ctx.output_split=output_split
+
+        input = input.contiguous()
+        output = torch.zeros(sum(output_split), device=input.device, dtype=input.dtype)
+        dist.all_to_all_single(output=output, tensor=input, output_split_sizes=output_split, 
+                               input_split_sizes=input_split, group=group)
+        return output
+
+    @staticmethod
+    def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor]:
+        # print(f"grad_output[0].shape:{grad_output[0].shape}")
+        # print(f"input_split:{ctx.output_split}")
+        # print(f"output_split:{ctx.input_split}")
+        return (None,
+                _AllToAll_UNEQUAL.apply(ctx.group, grad_output[0], 
+                                              ctx.output_split, ctx.input_split),
+                None,
+                None)
+    
 
 # einsum rewrites are on par or more performant
 # switch can be bubbled up in future
@@ -166,7 +200,7 @@ def _capacity(gates: Tensor, capacity_factor: Tensor, min_capacity: Tensor) -> T
 
 @torch.jit.script
 def _top_idx(source, k):
-    return torch.topk(source, k=k, dim=0)[1]
+    return torch.topk(source, k=k, dim=0)[1]  # 按列找topk大，返回的是n行k列，内容为topk的具体值出现在原本序列中的位置(最后的[1])
 
 
 @torch.jit.script
@@ -174,7 +208,7 @@ def _one_hot_to_float(x, num_classes):
     return F.one_hot(x, num_classes=num_classes).float()
 
 
-def top1gating(logits: Tensor,
+def top1gating(logits: Tensor, # tokens after embedding
                capacity_factor: float,
                min_capacity: int,
                used_token: Tensor = None,
@@ -189,59 +223,76 @@ def top1gating(logits: Tensor,
     if noisy_gate_policy == 'RSample':
         logits_w_noise = logits + gumbel_rsample(logits.shape, device=logits.device)
     # everything is in fp32 in this function
-    gates = F.softmax(logits, dim=1)
+    gates = F.softmax(logits, dim=1) # gates.shape (num of tokens, num of experts) 按照experts的得分做softmax
 
     capacity = _capacity(gates,
                          torch.tensor(capacity_factor),
                          torch.tensor(min_capacity))
+    # logger.warning("capacity:{}".format(capacity))
 
     # Create a mask for 1st's expert per token
     # noisy gating
-    indices1_s = torch.argmax(
+    indices1_s = torch.argmax(  # 按行，选择top1
         logits_w_noise if noisy_gate_policy == 'RSample' else gates,
         dim=1)
     num_experts = int(gates.shape[1])
     mask1 = F.one_hot(indices1_s, num_classes=num_experts)
-
+    
+    # logger.warning("mask1.shape({})".format(mask1.shape)) # 8, 2
+    # logger.warning("mask1({})".format(mask1)) # 8, 2
+    
     # mask only used tokens
     if used_token is not None:
-        mask1 = einsum("s,se->se", used_token, mask1)
+        mask1 = einsum("s,se->se", used_token, mask1) # 按列相乘，不求和 s:num of tokens e: num of experts 
 
     # gating decisions
-    exp_counts = torch.sum(mask1, dim=0).detach().to('cpu')
+    exp_counts = torch.sum(mask1, dim=0).detach().to('cpu') # shape:(1,e) 保存了发给每个experts的tokens数量,不受capacity限制
+
+    # logger.warning("exp_counts.shape({})".format(exp_counts.shape))
+    # logger.warning("exp_counts({})".format(exp_counts))
 
     # if we don't want to drop any tokens
     if not drop_tokens:
         new_capacity = torch.max(exp_counts).to(logits.device)
-        dist.all_reduce(new_capacity, op=dist.ReduceOp.MAX, group=dist.get_world_group())
+        dist.all_reduce(new_capacity, op=dist.ReduceOp.MAX, group=dist.get_world_group())  # all reduce以group=world，求world中所有的new_capacity的最大值
         capacity = new_capacity
 
     # Compute l_aux
-    me = torch.mean(gates, dim=0)
-    ce = torch.mean(mask1.float(), dim=0)
+    me = torch.mean(gates, dim=0) # 按列求均值 -> 所有tokens，在每个expert的权重的平均分 
+    ce = torch.mean(mask1.float(), dim=0) # 每个experts上，平均通过的tokens数量
     l_aux = torch.sum(me * ce) * num_experts
 
     # Random Token Selection
     if use_rts:
         uniform = exp_selection_uniform_map.get(logits.device)
         if uniform is None:
-            uniform = torch.distributions.uniform.Uniform(
+            uniform = torch.distributions.uniform.Uniform( # 均匀分布
                 low=torch.tensor(0.0,
                                  device=logits.device),
                 high=torch.tensor(1.0,
                                   device=logits.device)).rsample
             exp_selection_uniform_map[logits.device] = uniform
 
-        mask1_rand = mask1 * uniform(mask1.shape)
+        mask1_rand = mask1 * uniform(mask1.shape)  # 均匀分布
     else:
         mask1_rand = mask1
 
+    # logger.warning("mask1_rand.shape({})".format(mask1_rand.shape)) # 8,2
+    # logger.warning("mask1_rand({})".format(mask1_rand)) # 8,2
+
+
     assert logits.shape[0] >= min_capacity, "No. of tokens (batch-size) should be greater than min_capacity. Either set min_capacity to 0 or increase your batch size."
 
-    top_idx = _top_idx(mask1_rand, capacity)
+    top_idx = _top_idx(mask1_rand, capacity) # 返回 capacity行，expert列，数值为：发送给每个expert的具体tokens的位置(mask1_rand中，按列从大到小排序的下标)
 
-    new_mask1 = mask1 * torch.zeros_like(mask1).scatter_(0, top_idx, 1)
+    # logger.warning("top_idx.shape({})".format(top_idx.shape)) # 4, 2
+    # logger.warning("top_idx({})".format(top_idx)) # 4, 2
+
+    new_mask1 = mask1 * torch.zeros_like(mask1).scatter_(0, top_idx, 1) # dim=0，表示在top_idx元素行号用其元素值代替，列号不变，以这两个值索引，在结果new_mask1中填1
     mask1 = new_mask1
+
+    # logger.warning("new_mask1.shape({})".format(new_mask1.shape))
+    # logger.warning("new_mask1({})".format(new_mask1))
 
     if use_tutel:
         # Tutel doesn't support index values masked with zero
@@ -250,10 +301,14 @@ def top1gating(logits: Tensor,
         indices1_s = torch.min(indices1_s, indices_mask)
 
     # Compute locations in capacity buffer
+    # location1 shape:(num of tokens, num of experts) 表示了每个token的dispatch对于experts capacity的变化
     if use_tutel:
         locations1 = tutel_moe.fast_cumsum_sub_one(mask1)
     else:
         locations1 = torch.cumsum(mask1, dim=0) - 1
+
+    # logger.warning("locations1.shape({})".format(locations1.shape))
+    # logger.warning("locations1({})".format(locations1))
 
     if use_tutel:
         gates1_s = (gates * mask1).sum(dim=1)
@@ -261,24 +316,42 @@ def top1gating(logits: Tensor,
         return l_aux, capacity, num_experts, [indices1_s,], [locations1_s,], [gates1_s,], exp_counts
 
     # Store the capacity location for each token
-    locations1_s = torch.sum(locations1 * mask1, dim=1)
+    # 求和是为了记录每个tokens经过dispatch后，对于expert capacity的大小
+    locations1_s = torch.sum(locations1 * mask1, dim=1)  # 经过 *mask 操作， 每行只有一个非零元素（代表第k列的expert的capacity情况）
 
+    # logger.warning("locations1_s.shape({})".format(locations1_s.shape))
+    # logger.warning("locations1_s({})".format(locations1_s))
+    
     # Normalize gate probabilities
     mask1_float = mask1.float()
-    gates = gates * mask1_float
+    gates = gates * mask1_float  # gates代表具体dispatch到哪个expert，第k列代表dispatch给第k个experts的tokens
+    
+    # logger.warning("gates({})".format(gates))
 
-    locations1_sc = _one_hot_to_float(locations1_s, capacity)
+    locations1_sc = _one_hot_to_float(locations1_s, capacity) # location_sc代表每个tokens在experts capacity的one_hot编码, 第k列代表占用的capacity是第几个
+    # logger.warning("locations1_sc.shape({})".format(locations1_sc.shape))
+    # logger.warning("locations1_sc({})".format(locations1_sc))
+    # einsum之后得到mask的表
     combine_weights = einsum("se,sc->sec", gates, locations1_sc)
+    
+    # logger.warning("combine_weights.shape({})".format(combine_weights.shape))
+    # logger.warning("combine_weights({})".format(combine_weights))
+    
 
     dispatch_mask = combine_weights.bool()
+    
+    # logger.warning("dispatch_mask.shape({})".format(dispatch_mask.shape))
+    # logger.warning("dispatch_mask({})".format(dispatch_mask))
+    
+    # exit(0)
+    
 
     return l_aux, combine_weights, dispatch_mask, exp_counts
 
 
 def top2gating(logits: Tensor,
                capacity_factor: float,
-               min_capacity: int,
-               use_both_masks=False) -> Tuple[Tensor,
+               min_capacity: int) -> Tuple[Tensor,
                                            Tensor,
                                            Tensor,
                                            Tensor]:
@@ -290,6 +363,122 @@ def top2gating(logits: Tensor,
                          torch.tensor(capacity_factor * 2),
                          torch.tensor(min_capacity))
 
+    # logger.debug("gates.shape:{}".format(gates.shape))
+    # logger.debug("gates:{}".format(gates))
+    # logger.debug("capacity:{}".format(capacity))
+    # logger.debug("capacity_factor:{}".format(capacity_factor*2))
+    
+    # Create a mask for 1st's expert per token
+    indices1_s = torch.argmax(gates, dim=1)
+    num_experts = int(gates.shape[1])
+    mask1 = F.one_hot(indices1_s, num_classes=num_experts)
+    # logger.debug("mask1.shape({})".format(mask1.shape)) # 8，4
+    # logger.debug("mask1({})".format(mask1)) # 
+
+    # Create a mask for 2nd's expert per token using Gumbel-max trick
+    # https://timvieira.github.io/blog/post/2014/07/31/gumbel-max-trick/
+    logits_w_noise = logits + gumbel_rsample(logits.shape, device=logits.device)
+    # Replace top-expert with min value
+    logits_except1 = logits_w_noise.masked_fill(mask1.bool(), float("-inf"))
+    indices2_s = torch.argmax(logits_except1, dim=1)
+    mask2 = F.one_hot(indices2_s, num_classes=num_experts)
+
+    # logger.debug("indices2_s({})".format(indices2_s))  
+    # logger.debug("mask2({})".format(mask2))  
+    # logger.debug("logits_except1.shape({})".format(logits_except1.shape))  
+    # logger.debug("logits({})".format(logits))  
+    # logger.debug("gumbel_rsample(logits.shape)({})".format(gumbel_rsample(logits.shape, device=logits.device)))  
+    # logger.debug("logits_w_noise({})".format(logits_w_noise))  
+    # logger.debug("logits_except1({})".format(logits_except1))  
+    # logger.debug("mask2.shape({})".format(mask2.shape))  
+    # logger.debug("mask2({})".format(mask2)) # 
+
+    # Compute locations in capacity buffer
+    locations1 = torch.cumsum(mask1, dim=0) - 1
+    locations2 = torch.cumsum(mask2, dim=0) - 1
+    # Update 2nd's location by accounting for locations of 1st
+    locations2 += torch.sum(mask1, dim=0, keepdim=True)
+
+    # logger.debug("locations1.shape({})".format(locations1.shape))
+    # logger.debug("locations1({})".format(locations1))
+    # logger.debug("locations2({})".format(locations2))
+    
+    # gating decisions
+    exp_counts = torch.sum(mask1 + mask2, dim=0).detach().to('cpu')
+    # logger.debug("exp1_counts({})".format(exp_counts))
+    # exp_counts_2 = torch.sum(mask2, dim=0).detach().to('cpu')
+    # logger.debug("exp2_counts({})".format(exp_counts_2))
+
+    # Compute l_aux
+    me = torch.mean(gates, dim=0)
+    # ce = torch.mean(mask1.float(), dim=0)
+    ce = torch.mean((mask1 + mask2).float(), dim=0)
+    # l_aux = torch.mean(me * ce) * num_experts * num_experts
+    l_aux = torch.mean(me * ce) * num_experts * num_experts * 1/2
+    
+    # print("l_aux", l_aux)
+    # logger.debug("ce2:{}".format(ce2))
+    # logger.debug("new_mask:{}".format(new_mask))
+    # print("new_l_aux", new_l_aux)
+
+    # Remove locations outside capacity from mask
+    mask1 *= torch.lt(locations1, capacity)
+    mask2 *= torch.lt(locations2, capacity)
+
+    # Store the capacity location for each token
+    locations1_s = torch.sum(locations1 * mask1, dim=1)
+    locations2_s = torch.sum(locations2 * mask2, dim=1)
+
+    # Normalize gate probabilities
+    mask1_float = mask1.float()
+    mask2_float = mask2.float()
+    gates1_s = einsum("se,se->s", gates, mask1_float) # top1 gate选择的tokens的权重
+    gates2_s = einsum("se,se->s", gates, mask2_float) # top2 gate选择的tokens的权重
+    denom_s = gates1_s + gates2_s
+    
+    # logger.debug("mask1_float:{}".format(mask1_float))
+    # logger.debug("gates:{}".format(gates))
+    # logger.debug("gates1_s:{}".format(gates1_s))
+    # logger.debug("gates2_s:{}".format(gates2_s))
+    
+    # Avoid divide-by-zero
+    denom_s = torch.clamp(denom_s, min=torch.finfo(denom_s.dtype).eps)
+    gates1_s /= denom_s
+    gates2_s /= denom_s
+    # logger.debug("gates1_s_new:{}".format(gates1_s))
+    # logger.debug("gates2_s_new:{}".format(gates2_s))
+
+    # Calculate combine_weights and dispatch_mask
+    gates1 = einsum("s,se->se", gates1_s, mask1_float)
+    gates2 = einsum("s,se->se", gates2_s, mask2_float)
+    # logger.debug("gates1:{}".format(gates1)) # 8,4
+    locations1_sc = _one_hot_to_float(locations1_s, capacity)
+    locations2_sc = _one_hot_to_float(locations2_s, capacity)
+    # logger.debug("locations1_sc:{}".format(locations1_sc)) # 8,4
+    combine1_sec = einsum("se,sc->sec", gates1, locations1_sc)
+    combine2_sec = einsum("se,sc->sec", gates2, locations2_sc)
+    combine_weights = combine1_sec + combine2_sec
+    # logger.debug("combine_weights:{}".format(combine_weights)) # 8,4,4
+    dispatch_mask = combine_weights.bool()
+
+    return l_aux, combine_weights, dispatch_mask, exp_counts
+
+
+def dynamicgating(logits: Tensor,
+               capacity_factor: float,
+               min_capacity: int,
+               threshold) -> Tuple[Tensor,
+                                           Tensor,
+                                           Tensor,
+                                           Tensor]:
+    """Implements Top2Gating on logits."""
+    # everything is in fp32 in this function
+    gates = F.softmax(logits, dim=1)
+
+    capacity = _capacity(gates,
+                         torch.tensor(capacity_factor * 2),
+                         torch.tensor(min_capacity))
+    # print(f" current capacity is: {capacity}")
     # Create a mask for 1st's expert per token
     indices1_s = torch.argmax(gates, dim=1)
     num_experts = int(gates.shape[1])
@@ -303,6 +492,27 @@ def top2gating(logits: Tensor,
     indices2_s = torch.argmax(logits_except1, dim=1)
     mask2 = F.one_hot(indices2_s, num_classes=num_experts)
 
+    # logger.debug("logits:{}".format(logits))
+    # logger.debug("mask1:{}".format(mask1))
+    # logger.debug("mask2:{}".format(mask2))
+    
+    # get the top1 & top2 logits value
+    top1_val = gates.masked_select(mask1.bool())
+    top2_val = gates.masked_select(mask2.bool())
+    dynamic_mask = (abs(top1_val - top2_val) > threshold).unsqueeze(1) # larger than threshold -> choose top1 gate -> remove dispatch entry from mask2
+    # logger.debug("mean top1-top2:{}".format(torch.mean(top1_val - top2_val)))
+    top1_selectednum = dynamic_mask.sum()
+    top2_selectednum = logits.size(0) - top1_selectednum
+    mask2 = mask2.masked_fill(dynamic_mask, False) # remask the dispatch tokens
+    mean_threshold = torch.mean(top1_val - top2_val).detach()
+    
+    # logger.debug("top1_val:{}".format(top1_val))
+    # logger.debug("top2_val:{}".format(top2_val))
+    # logger.debug("dynamic_mask:{}".format(dynamic_mask))
+    # logger.debug("top2_selectednum:{}".format(top2_selectednum))
+    # logger.debug("top1_selectednum:{}".format(top1_selectednum))
+    # logger.debug("mask2:{}".format(mask2))
+    
     # Compute locations in capacity buffer
     locations1 = torch.cumsum(mask1, dim=0) - 1
     locations2 = torch.cumsum(mask2, dim=0) - 1
@@ -310,19 +520,15 @@ def top2gating(logits: Tensor,
     locations2 += torch.sum(mask1, dim=0, keepdim=True)
 
     # gating decisions
-    exp_counts = torch.sum(mask1 + mask2, dim=0).detach().to('cpu')
+    exp_counts = torch.sum(mask1 + mask2, dim=0).detach().to('cpu')  # 不受capacity限制的发送数目
 
     # Compute l_aux
     me = torch.mean(gates, dim=0)
+    # ce = torch.mean(mask1.float(), dim=0)
+    ce = torch.mean((mask1 + mask2).float(), dim=0)
+    # l_aux = torch.mean(me * ce) * num_experts * num_experts
+    l_aux = torch.mean(me * ce) * num_experts * num_experts * 1/2
     
-    # Whether to use both masks in calculating l_aux
-    if use_both_masks is True:
-        ce = torch.mean((mask1 + mask2).float(), dim=0)
-        l_aux = torch.mean(me * ce) * num_experts * num_experts * 1/2
-    else:
-        ce = torch.mean(mask1.float(), dim=0)
-        l_aux = torch.mean(me * ce) * num_experts * num_experts
-
     # Remove locations outside capacity from mask
     mask1 *= torch.lt(locations1, capacity)
     mask2 *= torch.lt(locations2, capacity)
@@ -334,26 +540,39 @@ def top2gating(logits: Tensor,
     # Normalize gate probabilities
     mask1_float = mask1.float()
     mask2_float = mask2.float()
-    gates1_s = einsum("se,se->s", gates, mask1_float)
-    gates2_s = einsum("se,se->s", gates, mask2_float)
+    gates1_s = einsum("se,se->s", gates, mask1_float) # top1 gate选择的tokens的权重
+    gates2_s = einsum("se,se->s", gates, mask2_float) # top2 gate选择的tokens的权重
     denom_s = gates1_s + gates2_s
+    # logger.debug("gates1_s:{}".format(gates1_s)) # 8,4,4
+    # logger.debug("gates2_s:{}".format(gates2_s)) # 8,4,4
+    
     # Avoid divide-by-zero
     denom_s = torch.clamp(denom_s, min=torch.finfo(denom_s.dtype).eps)
     gates1_s /= denom_s
     gates2_s /= denom_s
+    # logger.debug("min=torch.finfo(denom_s.dtype).eps:{}".format(torch.finfo(denom_s.dtype).eps))
+    # logger.debug("gates1_s_new:{}".format(gates1_s)) # 8,4,4
+    # logger.debug("gates2_s_new:{}".format(gates2_s)) # 8,4,4
 
     # Calculate combine_weights and dispatch_mask
     gates1 = einsum("s,se->se", gates1_s, mask1_float)
     gates2 = einsum("s,se->se", gates2_s, mask2_float)
+    # logger.debug("gates1:{}".format(gates1)) # 8,4,4
+    # logger.debug("gates2:{}".format(gates2)) # 8,4,4
+    # logger.debug("gates1:{}".format(gates1)) # 8,4
     locations1_sc = _one_hot_to_float(locations1_s, capacity)
     locations2_sc = _one_hot_to_float(locations2_s, capacity)
+    # logger.debug("locations1_sc:{}".format(locations1_sc)) # 8,4
     combine1_sec = einsum("se,sc->sec", gates1, locations1_sc)
     combine2_sec = einsum("se,sc->sec", gates2, locations2_sc)
+    # logger.debug("combine1_sec:{}".format(combine1_sec)) # 8,4,4
+    # logger.debug("combine2_sec:{}".format(combine2_sec)) # 8,4,4
     combine_weights = combine1_sec + combine2_sec
+    # logger.debug("combine_weights:{}".format(combine_weights)) # 8,4,4
     dispatch_mask = combine_weights.bool()
+    # logger.debug("dispatch_mask:{}".format(dispatch_mask)) # 8,4,4
 
-    return l_aux, combine_weights, dispatch_mask, exp_counts
-
+    return l_aux, combine_weights, dispatch_mask, (exp_counts, top1_selectednum, top2_selectednum), mean_threshold
 
 class TopKGate(Module):
     """Gate module which implements Top2Gating as described in Gshard_.
@@ -382,12 +601,13 @@ class TopKGate(Module):
                  min_capacity: int = 8,
                  noisy_gate_policy: Optional[str] = None,
                  drop_tokens: bool = True,
-                 use_rts: bool = True) -> None:
+                 use_rts: bool = True,
+                 dyna_threshold: float = 0.075) -> None:
         super().__init__()
 
         # Only top-1 and top-2 are supported at the moment.
-        if k != 1 and k != 2:
-            raise ValueError('Only top-1 and top-2 gatings are supported.')
+        if k != 1 and k != 2 and k != 0:
+            raise ValueError('Only top-1 & top-2 & dynamic gatings are supported.')
         self.wg = torch.nn.Linear(model_dim, num_experts, bias=False).float()
         self.k = k
         self.capacity_factor = capacity_factor
@@ -399,6 +619,7 @@ class TopKGate(Module):
         self.gate_time = 0.0
         self.drop_tokens = drop_tokens
         self.use_rts = use_rts
+        self.dyna_threshold = torch.nn.Parameter(torch.Tensor([dyna_threshold]), requires_grad = False) # for model restore
 
     def forward(
             self,
@@ -430,11 +651,21 @@ class TopKGate(Module):
                 self.use_rts,
                 use_tutel)
 
-        else:
+        elif self.k == 2:
             gate_output = top2gating(
                 logits,
                 self.capacity_factor if self.training else self.eval_capacity_factor,
                 self.min_capacity)
+        else:
+            gate_output = dynamicgating(
+                logits,
+                self.capacity_factor if self.training else self.eval_capacity_factor,
+                self.min_capacity,
+                threshold=self.dyna_threshold
+                )
+            self.dyna_threshold[0] = 0.95 * self.dyna_threshold + 0.04 * gate_output[4]
+            gate_output = gate_output[0:4]
+            
 
         if self.wall_clock_breakdown:
             self.timers('TopKGate').stop()
@@ -502,11 +733,13 @@ class MOELayer(Base):
 
         # Implement Algorithm 2 from GShard paper.
         d_model = input[0].shape[-1]
+        # logger.debug("d_model:{}".format(d_model)) # 8
 
         # Initial implementation -> Reshape into S tokens by dropping sequence dimension.
         # Reshape into G groups so that each group can distribute tokens equally
         # group_size = kwargs['group_size'] if 'group_size' in kwargs.keys() else 1
         reshaped_input = input[0].reshape(-1, d_model)
+        # logger.debug("input.shape({})".format(input[0].shape)) # 8, 84
 
         if self.use_tutel:
             self.l_aux, C, E, indices_, locations_, gates_, self.exp_counts = self.gate(reshaped_input, input[1], True)
@@ -522,9 +755,41 @@ class MOELayer(Base):
             dispatched_input = self._tutel_dispatcher.encode(reshaped_input)
         else:
             self.l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(reshaped_input, input[1])
+            # 通过top1 gate之后生成的一个dispatch_mask的具体形式是(num of tokens, num of experts, capacity)
+            # 其中num of experts, capacity中，第n行代表分配给第n个expert的token情况，第n列代表当前token是capacity的第几个
+            # 例如dispatch_mask为(8,2,4)的情形时：
+            # [[False, False, False, False],    第一个token 不分配给expert1
+            #  [ True, False, False, False]],                分配给expert2，占用其第一个capacity 1/4
+            
+            # [[ True, False, False, False],    第二个token 分配给expert 1，占用其第一个capacity 1/4
+            #  [False, False, False, False]],               不分配给expert 2
+
+            # [[False, False, False, False],    第三个token  
+            #  [False,  True, False, False]],               分配给expert2，占用其第二个capacity 2/4
+    
+            # [[False,  True, False, False],    第三个token  分配给expert1，占用其第二个capacity 2/4
+            #  [False, False, False, False]],
+    
+            # [[False, False, False, False],
+            #  [False, False,  True, False]],
+    
+            # [[False, False,  True, False],
+            #  [False, False, False, False]],
+    
+            # [[False, False, False, False],
+            #  [False, False, False,  True]],
+    
+            # [[False, False, False,  True],
+            #  [False, False, False, False]]
+            # logger.debug("dispatch_mask.shape({}), dispatch_mask:{}".format(dispatch_mask.shape, dispatch_mask)) # 8, 2, 4
             dispatched_input = einsum("sec,sm->ecm",
                                       dispatch_mask.type_as(input[0]),
-                                      reshaped_input)
+                                      reshaped_input)  # 8, 84
+            # 这里通过einsum和将mask与tokens相乘，得到最终分派给不同experts的具体tokens
+            # 例如这里的 einsum (8, 2, 4) * (8, 84) -> (2, 4, 84) 就是用8个(2,4)矩阵里的每一个元素与(8, 84)矩阵每行的元素相乘 -> 一共得到84列矩阵
+            # 在mask的8个(2, 4)的矩阵联系起来，(1,1,1) (2,1,1) ... (8,1,1)连起来，代表了dispatch到第一个expert的capacity为1/4的具体token是什么
+            # logger.debug("dispatched_input.shape({}), dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
+
 
         if self.wall_clock_breakdown:
             self.timers('falltoall').start()
@@ -537,18 +802,25 @@ class MOELayer(Base):
             # this also doubles up as a communication optimization as we are
             # reducing the all-to-all communication volume.
             dispatched_input = drop_tokens(dispatched_input, dim=1)
-
+            # logger.debug("groups._get_expert_model_parallel_world_size({})".format(groups._get_expert_model_parallel_world_size())) # 2, 4, 84
+            # logger.debug("Drop tokens -> dispatched_input.shape({}), \n dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
+            
+        # logger.debug(f"Before all2all dispatched_input.shape({dispatched_input.shape}) data:{dispatched_input}") # 2, 4, 84
         dispatched_input = _AllToAll.apply(self.ep_group, dispatched_input)
+        # logger.debug(f"After all2all dispatched_input.shape({dispatched_input.shape}) data:{dispatched_input}") # 2, 4, 84
 
         if self.wall_clock_breakdown:
             self.timers('falltoall').stop()
             self.time_falltoall = self.timers('falltoall').elapsed(reset=False)
 
         # Re-shape after all-to-all: ecm -> gecm
+        # logger.debug("ep_size:{} num_local_experts:{}".format(self.ep_size, self.num_local_experts)) # 
+        
         dispatched_input = dispatched_input.reshape(self.ep_size,
                                                     self.num_local_experts,
                                                     -1,
                                                     d_model)
+        # logger.debug("after reshape dispatched_input.shape({}), \n dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 1, 4, 84
 
         expert_output = self.experts(dispatched_input)
 
@@ -572,6 +844,11 @@ class MOELayer(Base):
             # non-expert of the next layer.
             expert_output = gather_tokens(expert_output, dim=1)
 
+        # logger.debug("expert_ouput.shape({}), expert_output:{}".format(expert_output.shape, expert_output))
+        # logger.debug("combine_weights.shape({}), combine_weights:{}".format(combine_weights.shape, combine_weights.type_as(input[0])))
+        # enisum: (8, 2, 4), (2, 4, 84) -> (8, 84)
+        # combine_weights是sparse的，在(2,4)中，只有一个元素非0，其他都是false
+        # einsum计算的结果为当前rank的tokens在expert计算结果 * 相应weight
         if self.use_tutel:
             combined_output = self._tutel_dispatcher.decode(expert_output.view(E * C, M))
         else:
@@ -579,10 +856,280 @@ class MOELayer(Base):
                                      combine_weights.type_as(input[0]),
                                      expert_output)
 
+        # logger.debug("combined_output.shape({}), combined_output:{}".format(combined_output.shape, combined_output))
         a = combined_output.reshape(input[0].shape)
+        # logger.debug("a.shape({}), a:{}".format(a.shape, a))
 
         if self.wall_clock_breakdown:
             self.timers('moe').stop()
             self.time_moe = self.timers('moe').elapsed(reset=False)
 
+        exit(0)
         return a
+
+
+class DynamicMOELayer(Base):
+    """MOELayer module which implements MixtureOfExperts as described in Gshard_.
+    ::
+
+        gate = TopKGate(model_dim, num_experts)
+        moe = MOELayer(gate, expert)
+        output = moe(input)
+        l_aux = moe.l_aux
+
+    .. Gshard_: https://arxiv.org/pdf/2006.16668.pdf
+
+    Args:
+        gate (torch.nn.Module):
+            gate network
+        expert (torch.nn.Module):
+            expert network
+    """
+    def __init__(self,
+                 gate: Module,
+                 experts: Module,
+                 ep_group_name,
+                 ep_size,
+                 num_local_experts: int,
+                 num_exp_replica: int,
+                 current_experts,
+                 current_intra_node_placement,
+                 use_tutel: bool = False) -> None:
+        super().__init__()
+        self.gate = gate
+        self.experts = experts
+        self.ep_group = None
+        self.ep_size = ep_size
+        self.ep_group_name = ep_group_name
+        self.num_local_experts = num_local_experts
+        self.num_exp_replica = num_exp_replica
+        self.current_experts = current_experts # current experts indices
+        self.time_falltoall = 0.0
+        self.time_salltoall = 0.0
+        self.time_moe = 0.0
+        self.timers = SynchronizedWallClockTimer()
+        self.wall_clock_breakdown = False
+        self.current_intra_node_placement=current_intra_node_placement # current intra-node placement info
+
+        self.use_tutel = use_tutel and TUTEL_INSTALLED and gate.k == 1
+
+        if self.use_tutel:
+            logger.info('Using Tutel optimizations.')
+        elif use_tutel and not TUTEL_INSTALLED:
+            logger.warning("Tutel optimization requested but not installed. "
+                           "Proceeding without Tutel.")
+        elif use_tutel and TUTEL_INSTALLED and gate.k != 1:
+            logger.warning(
+                "To enable Tutel optimization, use top-1 instead of top-2 gate. "
+                "Proceeding without Tutel.")
+
+    def _set_ep_group(self, ep_group):
+        self.ep_group = ep_group
+
+    def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
+        
+        intra_comm_group = groups._get_dynamic_expert_all_to_all_group()
+        
+        if self.wall_clock_breakdown:
+            self.timers('moe').start()
+
+        # Implement Algorithm 2 from GShard paper.
+        d_model = input[0].shape[-1]
+        # logger.debug("d_model:{}".format(d_model)) # 8
+
+        # Initial implementation -> Reshape into S tokens by dropping sequence dimension.
+        # Reshape into G groups so that each group can distribute tokens equally
+        # group_size = kwargs['group_size'] if 'group_size' in kwargs.keys() else 1
+        reshaped_input = input[0].reshape(-1, d_model)
+        # logger.debug("input.shape({})".format(input[0].shape)) # 8, 84
+
+        if self.use_tutel:
+            self.l_aux, C, E, indices_, locations_, gates_, self.exp_counts = self.gate(reshaped_input, input[1], True)
+            S, M = reshaped_input.size(0), reshaped_input.size(1)
+
+            if not hasattr(self, '_tutel_dispatcher'):
+                self._tutel_dispatcher = tutel_moe.fast_dispatcher(
+                    E,
+                    C,
+                    M,
+                    dispatch_dtype=reshaped_input.dtype)
+            self._tutel_dispatcher.update(indices_, locations_, gates_, capacity=C)
+            dispatched_input = self._tutel_dispatcher.encode(reshaped_input)
+        else:
+            self.l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(reshaped_input, input[1])
+            # 通过top1 gate之后生成的一个dispatch_mask的具体形式是(num of tokens, num of experts, capacity)
+            # 其中num of experts, capacity中，第n行代表分配给第n个expert的token情况，第n列代表当前token是capacity的第几个
+            # 例如dispatch_mask为(8,2,4)的情形时：
+            # [[False, False, False, False],    第一个token 不分配给expert1
+            #  [ True, False, False, False]],                分配给expert2，占用其第一个capacity 1/4
+            
+            # [[ True, False, False, False],    第二个token 分配给expert 1，占用其第一个capacity 1/4
+            #  [False, False, False, False]],               不分配给expert 2
+
+            # [[False, False, False, False],    第三个token  
+            #  [False,  True, False, False]],               分配给expert2，占用其第二个capacity 2/4
+    
+            # [[False,  True, False, False],    第三个token  分配给expert1，占用其第二个capacity 2/4
+            #  [False, False, False, False]],
+    
+            # [[False, False, False, False],
+            #  [False, False,  True, False]],
+    
+            # [[False, False,  True, False],
+            #  [False, False, False, False]],
+    
+            # [[False, False, False, False],
+            #  [False, False, False,  True]],
+    
+            # [[False, False, False,  True],
+            #  [False, False, False, False]]
+            # logger.debug("dispatch_mask.shape({}), dispatch_mask:{}".format(dispatch_mask.shape, dispatch_mask)) # 8, 2, 4
+            dispatched_input = einsum("sec,sm->ecm", # (num of experts, capacity, dimension)
+                                      dispatch_mask.type_as(input[0]),
+                                      reshaped_input)  # 8, 84
+            # 这里通过einsum和将mask与tokens相乘，得到最终分派给不同experts的具体tokens
+            # 例如这里的 einsum (8, 2, 4) * (8, 84) -> (2, 4, 84) 就是用8个(2,4)矩阵里的每一个元素与(8, 84)矩阵每行的元素相乘 -> 一共得到84列矩阵
+            # 在mask的8个(2, 4)的矩阵联系起来，(1,1,1) (2,1,1) ... (8,1,1)连起来，代表了dispatch到第一个expert的capacity为1/4的具体token是什么
+            # logger.debug("dispatched_input.shape({}), dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
+
+            _current_capacity = dispatched_input.shape[1]
+            chunks = dispatched_input.chunk(dispatched_input.shape[0], dim=0)
+            w = [u.squeeze() for u in chunks]
+            curr_exp_counts = self.exp_counts[0] if type(self.exp_counts) == tuple else self.exp_counts
+            for i, send in enumerate(curr_exp_counts):
+                w[i] = w[i][0:curr_exp_counts[i]]
+                # if curr_exp_counts[i] == 0:
+                #     w[i] = w[i].reshape(0)
+
+            # print(curr_exp_counts)
+            # print(w)
+            # print(w[0].shape)
+            # print(w[1].shape)
+            # print(w[2].shape)
+            # print(w[3].shape)
+            
+            # {num_local_experts} round all2all
+            recv_experts_outputs = []
+            for i in range(self.num_local_experts):
+                send_tokens_idx = []
+                for j in range(topology._get_gpu_per_node_number()):
+                    send_tokens_idx.append(self.current_intra_node_placement[j][i])
+                # print(f"in round{i} send tokens pos_idx:{send_tokens_idx}") 
+                
+                # first round: exchange size
+                token_send=[]
+                input_split=[]
+                for idx in send_tokens_idx:
+                    token_send.append(w[idx])
+                    input_split.append(w[idx].numel())
+                token_size2exchange=torch.tensor(input_split, device=token_send[0].device, dtype=torch.int32)
+                
+                # logger.debug(f"token_size2exchange:{token_size2exchange}")
+                
+                output_split = _AllToAll.apply(intra_comm_group, token_size2exchange).tolist()
+                
+                # logger.debug(f"output_split:{output_split}")
+
+                # second round: exchange data
+                flatten_send_tokens = flatten(token_send)
+                recv_expert_tokens = _AllToAll_UNEQUAL.apply(intra_comm_group, flatten_send_tokens,
+                                                       input_split, output_split)
+                curr_expert_tokens = recv_expert_tokens.reshape(-1, d_model)
+                # expert calculation
+                output = self.experts(curr_expert_tokens, i)
+                # print(f"output.shape: {output.shape}, output_split:{output_split}")
+                flatten_results = output.flatten()
+                # send results back
+                expert_outputs = _AllToAll_UNEQUAL.apply(intra_comm_group, flatten_results,
+                                                       output_split,input_split)
+                
+                # logger.debug(f"expert_outputs.shape: {expert_outputs.shape}, token_send[0].shape:{token_send[0].shape}, token_send[1].shape:{token_send[1].shape}")
+                
+                for _, sync in enumerate(unflatten(expert_outputs, token_send)):
+                    if sync.shape[0]==0: sync = sync.reshape((0, d_model))
+                    sync = torch.nn.functional.pad(
+                        sync, 
+                        (0,0,0,_current_capacity-sync.shape[0]), 
+                        'constant', 
+                        0)
+                    assert sync.shape[0] == _current_capacity
+                    recv_experts_outputs.append(sync)
+                
+                #TODO: GLOBAL experts calc
+                
+
+        if self.wall_clock_breakdown:
+            self.timers('falltoall').start()
+
+        if groups._get_expert_model_parallel_world_size() == 1:
+            # If the non-expert is tensor-parallel, it will create
+            # duplicate tokens on the tensor-parallel ranks.
+            # Since our experts are not tensor-parallel, these duplicates
+            # need to be dropped to ensure correctness.
+            # this also doubles up as a communication optimization as we are
+            # reducing the all-to-all communication volume.
+            dispatched_input = drop_tokens(dispatched_input, dim=1)
+            # logger.debug("groups._get_expert_model_parallel_world_size({})".format(groups._get_expert_model_parallel_world_size())) # 2, 4, 84
+            # logger.debug("Drop tokens -> dispatched_input.shape({}), \n dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
+            
+
+        # dispatched_input = _AllToAll.apply(self.ep_group, dispatched_input)
+        # logger.debug("After all2all dispatched_input.shape({}), \n dispatched_input:{}".format(dispatched_input.shape, dispatched_input)) # 2, 4, 84
+
+        if self.wall_clock_breakdown:
+            self.timers('falltoall').stop()
+            self.time_falltoall = self.timers('falltoall').elapsed(reset=False)
+
+        # Re-shape after all-to-all: ecm -> gecm        
+        # dispatched_input = dispatched_input.reshape(self.ep_size,
+        #                                             self.num_local_experts - self.num_exp_replica,
+        #                                             -1,
+        #                                             d_model)
+
+        # expert_output = self.experts(dispatched_input)
+
+        if self.wall_clock_breakdown:
+            self.timers('salltoall').start()
+
+        # expert_output = _AllToAll.apply(self.ep_group, expert_output)
+
+        if self.wall_clock_breakdown:
+            self.timers('salltoall').stop()
+            self.time_salltoall = self.timers('salltoall').elapsed(reset=False)
+
+        # Re-shape back: gecm -> ecm        
+        expert_output = torch.cat(recv_experts_outputs, dim=0) # 横向拼接
+        # print(f"expert_output.shape:{expert_output.shape}")
+        expert_output = expert_output.reshape(self.ep_size * (self.num_local_experts - self.num_exp_replica),
+                                              -1,
+                                              d_model)
+
+        if groups._get_expert_model_parallel_world_size() == 1:
+            # the dropped duplicate tokens need to be gathered on each
+            # tensor parallel rank again for the tensor-parallel
+            # non-expert of the next layer.
+            expert_output = gather_tokens(expert_output, dim=1)
+
+        # logger.debug("expert_ouput.shape({}), expert_output:{}".format(expert_output.shape, expert_output))
+        # logger.debug("combine_weights.shape({}), combine_weights:{}".format(combine_weights.shape, combine_weights.type_as(input[0])))
+        # enisum: (8, 2, 4), (2, 4, 84) -> (8, 84)
+        # combine_weights是sparse的，在(2,4)中，只有一个元素非0，其他都是false
+        # einsum计算的结果为当前rank的tokens在expert计算结果 * 相应weight
+        if self.use_tutel:
+            combined_output = self._tutel_dispatcher.decode(expert_output.view(E * C, M))
+        else:
+            combined_output = einsum("sec,ecm->sm",
+                                     combine_weights.type_as(input[0]),
+                                     expert_output)
+
+        # logger.debug("combined_output.shape({}), combined_output:{}".format(combined_output.shape, combined_output))
+        a = combined_output.reshape(input[0].shape)
+        # logger.debug("a.shape({}), a:{}".format(a.shape, a))
+
+        if self.wall_clock_breakdown:
+            self.timers('moe').stop()
+            self.time_moe = self.timers('moe').elapsed(reset=False)
+
+        # exit(0)
+        return a
+

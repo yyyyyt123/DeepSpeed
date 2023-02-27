@@ -4,7 +4,7 @@ import argparse
 import torch
 
 from deepspeed.pipe import PipelineModule, LayerSpec
-from deepspeed.moe.layer import MoE
+from deepspeed.moe.layer import MoE, DynamicMoE
 
 import deepspeed.comm as dist
 
@@ -67,6 +67,42 @@ class SimpleMoEModel(torch.nn.Module):
         sentence_embed = hidden_dim.mean(1)
         return self.cross_entropy_loss(sentence_embed, y)
 
+class SimpleDynamicMoEModel(torch.nn.Module):
+    def __init__(self, hidden_dim, 
+                 num_experts=4,
+                 ep_size=1, 
+                 use_residual=False,
+                 num_exp_replica=1):
+        super(SimpleDynamicMoEModel, self).__init__()
+        self.linear = torch.nn.Linear(hidden_dim, hidden_dim)
+        expert = torch.nn.Linear(hidden_dim, hidden_dim)
+        # using two MoE layers to check implications of sharing a single storage
+        self.linear2 = DynamicMoE(hidden_size=hidden_dim,
+                           expert=expert,
+                           layer_idx=0,
+                           ep_size=ep_size,
+                           use_residual=use_residual,
+                           num_experts=num_experts,
+                           k=1,
+                           num_exp_replica=num_exp_replica)
+        self.linear3 = DynamicMoE(hidden_size=hidden_dim,
+                           expert=expert,
+                           layer_idx=1,
+                           ep_size=ep_size,
+                           use_residual=use_residual,
+                           num_experts=num_experts,
+                           k=1,
+                           num_exp_replica=num_exp_replica)
+                           
+        self.cross_entropy_loss = torch.nn.CrossEntropyLoss()
+
+    def forward(self, x, y):
+        hidden_dim = self.linear(x)
+        output, _, _ = self.linear2(hidden_dim)
+        output, _, _ = self.linear3(output)
+        hidden_dim = hidden_dim + output
+        sentence_embed = hidden_dim.mean(1)
+        return self.cross_entropy_loss(sentence_embed, y)
 
 class SimplePRMoEModel(torch.nn.Module):
     def __init__(self, hidden_dim, num_experts=2, ep_size=1, use_residual=False):
@@ -244,7 +280,7 @@ def sequence_dataloader(model,
                         hidden_dim,
                         device,
                         seq_len: int = 32,
-                        dtype=torch.half):
+                        dtype=torch.float):
     batch_size = model.train_micro_batch_size_per_gpu()
     train_data = torch.randn(total_samples,
                              seq_len,

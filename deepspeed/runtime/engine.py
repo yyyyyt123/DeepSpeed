@@ -56,6 +56,7 @@ from deepspeed.runtime.sparse_tensor import SparseTensor
 
 from deepspeed.runtime import lr_schedules
 from deepspeed.utils import groups
+from deepspeed.utils import topology
 from deepspeed.utils import logger, log_dist, instrument_w_nvtx
 from deepspeed.utils.timer import ThroughputTimer, SynchronizedWallClockTimer
 from deepspeed.utils.debug import debug_extract_module_and_param_names
@@ -71,7 +72,7 @@ from .utils import ensure_directory_exists, get_ma_status
 from ..ops.op_builder import UtilsBuilder
 from ..ops.adam import FusedAdam
 from ..moe.sharded_moe import TopKGate, MOELayer
-from ..moe.layer import MoE
+from ..moe.layer import MoE, DynamicMoE
 from ..moe.utils import is_moe_param
 from ..git_version_info import version
 
@@ -192,6 +193,7 @@ class DeepSpeedEngine(Module):
         config=None,
         config_params=None,
         dont_change_device=False,
+        dynamic_expert_placement=False,
     ):
         super(DeepSpeedEngine, self).__init__()
         self.dont_change_device = dont_change_device
@@ -224,6 +226,8 @@ class DeepSpeedEngine(Module):
         self._global_grad_norm = None
         self.use_ds_comm = False  # False --> Use torch.dist, True --> Use ds.comm backend.
 
+        self.dynamic_expert_placement = dynamic_expert_placement
+        
         self.checkpoint_engine = None
 
         global dist
@@ -374,6 +378,8 @@ class DeepSpeedEngine(Module):
         util_ops = UtilsBuilder().load()
         self.flatten = util_ops.flatten
         self.unflatten = util_ops.unflatten
+        
+
 
     def destroy(self):
         if self.optimizer is not None and hasattr(self.optimizer, 'destroy'):
@@ -742,9 +748,6 @@ class DeepSpeedEngine(Module):
     def gradient_accumulation_steps(self):
         return self._config.gradient_accumulation_steps
 
-    def use_node_local_storage(self):
-        return self._config.use_node_local_storage
-
     def load_universal_checkpoint(self):
         return self._config.load_universal_checkpoint
 
@@ -834,13 +837,9 @@ class DeepSpeedEngine(Module):
         if self.mpu:
             dp_rank = self.mpu.get_data_parallel_rank()
 
-        rank = self.local_rank if self.use_node_local_storage() else dp_rank
-
         # only the first data parallel process needs to store the model checkpoint
-        # if you want to use node local storage this must be done by rank 0 on each
-        # node
         self.save_non_zero_checkpoint = (
-            rank == 0) or self.zero_optimization_partition_weights()
+            dp_rank == 0) or self.zero_optimization_partition_weights()
 
         if self.zero_optimization() or self.bfloat16_enabled():
             param_rank = dist.get_rank(group=self.optimizer.dp_process_group)
@@ -999,7 +998,12 @@ class DeepSpeedEngine(Module):
             # Broadcast the model for different parameters
             if is_moe_param(p):
                 if torch.is_tensor(p) and is_replicated(p):
-                    dist.broadcast(p,
+                    if p.group_name[:5]=='layer':
+                        dist.broadcast(p,
+                                   groups._get_dynamic_expert_broadcast_src_rank(p.group_name),
+                                   group=self.dynamic_expert_parallel_group[p.group_name])
+                    else:
+                        dist.broadcast(p,
                                    groups._get_expert_broadcast_src_rank(p.group_name),
                                    group=self.expert_data_parallel_group[p.group_name])
             else:
@@ -1048,6 +1052,10 @@ class DeepSpeedEngine(Module):
                     hasattr(param,
                             'ds_id') for param in self.module.parameters()):
                 self.__check_params(self.module, torch.bfloat16)
+            if self.zero_optimization_stage() == 0 and not self.pipeline_parallelism:
+                raise NotImplementedError(
+                    "When not running ZeRO, BF16 training support is only supported for Pipeline parallelism"
+                )
             self.module.bfloat16()
         else:
             self.__check_params(self.module, torch.float)
@@ -1058,6 +1066,9 @@ class DeepSpeedEngine(Module):
         # MoE related initialization
         for _, module in self.module.named_modules():
             if isinstance(module, MoE):
+                self.has_moe_layers = True
+                self.num_experts.append(module.num_experts)
+            elif isinstance(module, DynamicMoE):
                 self.has_moe_layers = True
                 self.num_experts.append(module.num_experts)
 
@@ -1087,6 +1098,7 @@ class DeepSpeedEngine(Module):
         self.mp_world_size = groups._get_model_parallel_world_size()
         self.expert_parallel_group = groups._get_expert_parallel_group_dict()
         self.expert_data_parallel_group = groups._get_expert_data_parallel_group_dict()
+        self.dynamic_expert_parallel_group = groups._get_dynamic_expert_parallel_group_dict()
 
         if not self.amp_enabled():
             self._broadcast_model()
@@ -1731,6 +1743,7 @@ class DeepSpeedEngine(Module):
         # TODO: Allreduce/average them across ranks for more accurate timing.
 
         # if deepspeed.comm.get_rank() == 0:
+        # TODO: fix moe_layer printing
         log_dist(
             f"rank={dist.get_rank()} time (ms) | forward: {fwd_time:.2f} (forward_moe: {moe_time:.2f}, 1st alltoall: {falltoall:.2f}, 2nd alltoall: {salltoall:.2f}, top-k: {gate_time:.2f})",
             ranks=[0])
@@ -1802,6 +1815,8 @@ class DeepSpeedEngine(Module):
             "must provide optimizer during init in order to use backward"
 
         self._start_timers(self.engine_timers.backward_inner_timers)
+        
+        print("prepared for backward !")
 
         if self.zero_optimization():
             self.optimizer.is_gradient_accumulation_boundary = self.is_gradient_accumulation_boundary(
@@ -1832,9 +1847,13 @@ class DeepSpeedEngine(Module):
 
         self._start_timers(self.engine_timers.backward_reduce_timers)
 
+        print("backward okkkkkkkk !")
+        
+        # print("before all reduce gradient")
         if allreduce_gradients and self.enable_backward_allreduce:
-            # Traditional code path that allreduces the module parameter grads
+        #     # Traditional code path that allreduces the module parameter grads
             self.allreduce_gradients()
+        # print("after all reduce gradient")
 
         self._stop_timers(self.engine_timers.backward_reduce_timers)
 
@@ -2067,6 +2086,7 @@ class DeepSpeedEngine(Module):
                 if self.monitor.enabled:
                     self._write_monitor()
 
+                # TODO:properly show timing log ?
                 if self.has_moe_layers:
                     fwd_time = self.timers(FORWARD_GLOBAL_TIMER).elapsed(reset=False)
                     self.print_forward_breakdown(fwd_time=fwd_time)
@@ -2221,8 +2241,19 @@ class DeepSpeedEngine(Module):
     def _get_gradients_for_reduction(self):
         non_expert_grads = []
         expert_grads = {}
-        if self.has_moe_layers:
-            for key in self.expert_data_parallel_group.keys():
+        
+        group=None
+        # print(f"self.has_moe_layers:{self.has_moe_layers}")
+        # print(f"self.dynamic_expert_placement:{self.dynamic_expert_placement}")
+        if self.has_moe_layers and self.dynamic_expert_placement:
+            group = self.dynamic_expert_parallel_group
+            # print("hererererer")
+        elif self.has_moe_layers:
+            group = self.expert_data_parallel_group
+            
+        # print(group, "*"*10)
+        if group is not None:
+            for key in group.keys():
                 expert_grads[key] = []
 
         for param_name, param in self.module.named_parameters():
@@ -2280,6 +2311,22 @@ class DeepSpeedEngine(Module):
                         bucket,
                         dp_group=groups._get_expert_data_parallel_group(ep_name),
                         numel_per_bucket=elements_per_buffer)
+    
+    def _reduce_dynamic_expert_gradients(self, expert_grads, elements_per_buffer):
+        for ep_name, expert_grads_group in expert_grads.items():
+            expert_split_buckets = split_half_float_double_sparse(expert_grads_group)
+            for i, bucket_tuple in enumerate(expert_split_buckets):
+                bucket_type, bucket = bucket_tuple
+                if bucket_type == SparseTensor.type():
+                    self.sparse_allreduce_no_retain(
+                        bucket,
+                        groups._get_expert_data_parallel_group(ep_name))
+                else:
+                    # Separate between diff groups
+                    self.allreduce_no_retain(
+                        bucket,
+                        dp_group=groups._get_dynamic_expert_parallel_group(ep_name),
+                        numel_per_bucket=elements_per_buffer)
 
     def buffered_allreduce_fallback(self, grads=None, elements_per_buffer=500000000):
         if grads is None:
@@ -2291,7 +2338,10 @@ class DeepSpeedEngine(Module):
         self._reduce_non_expert_gradients(non_expert_grads, elements_per_buffer)
 
         if self.has_moe_layers:
-            self._reduce_expert_gradients(expert_grads, elements_per_buffer)
+            if self.dynamic_expert_placement:
+                self._reduce_dynamic_expert_gradients(expert_grads, elements_per_buffer)
+            else:
+                self._reduce_expert_gradients(expert_grads, elements_per_buffer)
 
     def sparse_allreduce_no_retain(self, bucket, dp_group):
         allreduced_sparses = self.sparse_allreduce_bucket(bucket, dp_group)
@@ -2811,6 +2861,7 @@ class DeepSpeedEngine(Module):
             mp_rank=mp_rank,
             dp_world_size=self.loaded_checkpoint_dp_world_size,
             bf16_mode=bf16_mode)
+        invalid_zero_ckpt_paths = []
         for i, ckpt_name in enumerate(zero_ckpt_names):
             if not os.path.exists(ckpt_name):
                 # transparently handle the old file pattern for optim_states
@@ -2820,6 +2871,13 @@ class DeepSpeedEngine(Module):
                     if os.path.exists(ckpt_name_try):
                         zero_ckpt_names[i] = ckpt_name_try
                         continue
+                invalid_zero_ckpt_paths.append(ckpt_name)
+
+        if len(invalid_zero_ckpt_paths) > 0:
+            logger.warn(
+                f"The following zero checkpoints paths are missing: {invalid_zero_ckpt_paths}"
+            )
+            return None
 
         return zero_ckpt_names
 
@@ -2827,10 +2885,8 @@ class DeepSpeedEngine(Module):
         zero_sd_list = []
         for i, ckpt_name in enumerate(zero_ckpt_names):
             _state = None
-            if ckpt_name is None:
-                _state = {OPTIMIZER_STATE_DICT: None}
             # Fully load state for current rank
-            elif self.zero_elastic_checkpoint() or dist.get_rank(
+            if self.zero_elastic_checkpoint() or dist.get_rank(
                     group=self.optimizer.dp_process_group) == i:
                 _state = self.checkpoint_engine.load(
                     ckpt_name,
@@ -2899,8 +2955,6 @@ class DeepSpeedEngine(Module):
             # Prepare for checkpoint save by ensuring all parameters are partitioned
             self.optimizer.checkpoint_event_prologue()
 
-        rank = self.local_rank if self.use_node_local_storage() else self.global_rank
-
         # This is to make sure the checkpoint names are created without collision
         # There seems to be issue creating them in parallel
 
@@ -2940,7 +2994,7 @@ class DeepSpeedEngine(Module):
 
         # Save latest checkpoint tag
         self.checkpoint_engine.commit(tag)
-        if save_latest and rank == 0:
+        if save_latest and self.global_rank == 0:
             with open(os.path.join(save_dir, 'latest'), 'w') as fd:
                 fd.write(tag)
 
